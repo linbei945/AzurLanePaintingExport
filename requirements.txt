@@ -1,0 +1,7 @@
+# 运行依赖
+UnityPy==1.25.4
+Pillow>=10.0
+PySide6-Essentials>=6.5
+
+# 打包依赖（仅构建 exe 时需要）
+pyinstaller>=6.0
