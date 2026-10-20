@@ -53,7 +53,7 @@ import worker
 from core import AssetSource, face_bundle_name
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 
 STATUS_IDLE = "未导出"
 STATUS_DONE = "已完成"
@@ -154,6 +154,11 @@ class PreviewView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        # Keep the viewport size constant: an appearing scrollbar changes the
+        # viewport, which re-triggers the auto-fit and makes the image/zoom
+        # flicker between two values at certain splitter positions.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setAlignment(Qt.AlignCenter)
         self.setFrameShape(QFrame.NoFrame)
         self.setMinimumHeight(240)
@@ -162,6 +167,7 @@ class PreviewView(QGraphicsView):
         self._placeholder = "选择左侧立绘查看合成预览"
         self.setToolTip("滚轮缩放 · 按住左键拖动平移 · 双击切换 1:1 / 适应窗口")
         self._auto_fit = True
+        self._fitting = False
         self._fit_timer = QTimer(self)
         self._fit_timer.setSingleShot(True)
         self._fit_timer.setInterval(60)
@@ -196,8 +202,12 @@ class PreviewView(QGraphicsView):
     def fit(self) -> None:
         if not self.has_image():
             return
-        self._auto_fit = True
-        self.fitInView(self._item, Qt.KeepAspectRatio)
+        self._fitting = True
+        try:
+            self._auto_fit = True
+            self.fitInView(self._item, Qt.KeepAspectRatio)
+        finally:
+            self._fitting = False
         self._emit_zoom()
 
     def zoom_reset(self) -> None:
@@ -219,8 +229,9 @@ class PreviewView(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if self.has_image() and self._auto_fit:
-            self._fit_timer.start()
+        if self._fitting or not self.has_image() or not self._auto_fit:
+            return
+        self._fit_timer.start()
 
     def _emit_zoom(self) -> None:
         self.zoom_changed.emit(self.transform().m11())
