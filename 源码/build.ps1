@@ -7,6 +7,14 @@ $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $appDir
 
 Write-Host "使用 Python: $Python"
+
+# 图标由 make_icon.py 生成，第一次打包时 assets 目录还不存在
+if (-not (Test-Path "assets\app.ico")) {
+    Write-Host "生成图标 assets\app.ico ..."
+    & $Python make_icon.py
+    if ($LASTEXITCODE -ne 0) { throw "图标生成失败（需要 Pillow）" }
+}
+
 & $Python -m PyInstaller --noconfirm --clean --windowed --onedir `
     --name "AzurLanePaintingExport" `
     --icon "assets\app.ico" `

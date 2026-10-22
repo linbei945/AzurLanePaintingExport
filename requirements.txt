@@ -1,7 +1,8 @@
-# 运行依赖
+# 碧蓝航线立绘导出器 —— 运行 / 打包所需依赖
+# 安装：pip install -r requirements.txt
 UnityPy==1.25.4
 Pillow>=10.0
-PySide6-Essentials>=6.5
+PySide6>=6.5
 
-# 打包依赖（仅构建 exe 时需要）
+# 仅打包 exe 时需要（源码运行可忽略）
 pyinstaller>=6.0

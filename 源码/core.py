@@ -53,9 +53,6 @@ class V2:
             return V2(self.x * o.x, self.y * o.y)
         return V2(self.x * o, self.y * o)
 
-    def __truediv__(self, o: float) -> "V2":
-        return V2(self.x / o, self.y / o)
-
     def rounded(self) -> "V2":
         return V2(round(self.x), round(self.y))
 
@@ -121,7 +118,8 @@ class ExtTransform:
         if not self.parent:
             return V2()
         if not self.is_rect:
-            raise ValueError("origin on non rect transform")
+            # a plain Transform has no pivot / size, its position is the origin
+            return self.pivot_position()
         return self.pivot_position() - vec2(self.tr.m_Pivot) * self.size()
 
 
@@ -136,17 +134,12 @@ class Part:
     transform: ExtTransform
     paste: V2 = field(init=False)
     size: V2 = field(init=False)
-    unscaled: V2 = field(init=False)
-    scale: V2 = field(init=False)
-    mesh_bbox: Optional[Tuple[int, int, int, int]] = None
     _image: Optional[Image.Image] = field(default=None, repr=False, compare=False)
     _texture: Optional[Image.Image] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         self.paste = self.transform.origin().rounded()
         self.size = self.transform.size()
-        self.unscaled = self.transform.unscaled_size()
-        self.scale = self.transform.overall_scale()
 
 
 @dataclass
@@ -169,9 +162,6 @@ class Analysis:
     parts: List[Part]
     face: Optional[FaceSlot]
     canvas: Tuple[int, int]      # native painting canvas (raw sprite size)
-    native_scale: V2             # native px / UI unit
-    env: object = None           # keep bundles alive
-    warnings: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- bundle IO
@@ -222,9 +212,6 @@ class AssetSource:
                         pass
         return env
 
-    def list_paintings(self) -> List[str]:
-        return AssetSource.list_paintings_static(self.root)
-
     @staticmethod
     def list_paintings_static(root: str) -> List[str]:
         folder = os.path.join(root, "painting")
@@ -240,12 +227,6 @@ class AssetSource:
 
 
 # ---------------------------------------------------------------- analysis
-def _game_objects(env):
-    for o in env.objects:
-        if o.type.name == "GameObject":
-            yield o
-
-
 def _bundle_root(env):
     """First GameObject exposed by the bundle (a prefab), if any."""
     for o in env.objects:
@@ -289,7 +270,7 @@ def _mono_of(go):
     return None, None
 
 
-def analyze(source: AssetSource, name: str, keep_env: bool = False) -> Analysis:
+def analyze(source: AssetSource, name: str) -> Analysis:
     env = source.load_env(name)
     root = _bundle_root(env)
     if root is None:
@@ -297,7 +278,6 @@ def analyze(source: AssetSource, name: str, keep_env: bool = False) -> Analysis:
 
     parts: List[Part] = []
     face: Optional[FaceSlot] = None
-    warnings: List[str] = []
 
     def transform_of(go):
         for ptr, obj in _components(go):
@@ -342,10 +322,7 @@ def analyze(source: AssetSource, name: str, keep_env: bool = False) -> Analysis:
                             except Exception:
                                 mesh = None
                         raw = compute_raw_size(ptr, tree, sprite)
-                        part = Part(go_name, sprite.m_Name, sprite, mesh, raw, ext)
-                        if mesh is not None:
-                            part.mesh_bbox = mesh_bbox(mesh)
-                        parts.append(part)
+                        parts.append(Part(go_name, sprite.m_Name, sprite, mesh, raw, ext))
         for child in tr.m_Children:
             try:
                 walk(child.read(), ext)
@@ -367,10 +344,7 @@ def analyze(source: AssetSource, name: str, keep_env: bool = False) -> Analysis:
     if canvas[0] <= 0 or canvas[1] <= 0:
         raise RuntimeError("画布尺寸无效")
 
-    rect = primary.size
-    scale = V2(canvas[0] / rect.x if rect.x else 1.0, canvas[1] / rect.y if rect.y else 1.0)
-
-    return Analysis(name, root.m_Name, parts, face, canvas, scale, env if keep_env else None, warnings)
+    return Analysis(name, root.m_Name, parts, face, canvas)
 
 
 def compute_raw_size(mono_ptr, tree, sprite) -> V2:
@@ -384,21 +358,23 @@ def compute_raw_size(mono_ptr, tree, sprite) -> V2:
         return V2(1, 1)
 
 
-def mesh_bbox(mesh) -> Optional[Tuple[int, int, int, int]]:
-    try:
-        handler = MeshHandler(mesh)
-        handler.process()
-        verts = handler.m_Vertices or []
-        if not verts:
-            return None
-        xs = [v[0] for v in verts]
-        ys = [v[1] for v in verts]
-        return int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------- rebuilding
+def blend(dst: Image.Image, src: Image.Image, x: int, y: int) -> None:
+    """Composite ``src`` onto ``dst`` at (x, y), dropping what falls outside.
+
+    Layout rounding and the face-offset spinner can push a layer past the
+    left/top edge. Pillow tolerates that by compositing over a padded crop,
+    but the behaviour is subtle; clipping here is explicit and costs one
+    crop only in the rare out-of-bounds case.
+    """
+    cx, cy = max(0, -x), max(0, -y)
+    if cx >= src.width or cy >= src.height:
+        return
+    if cx or cy:
+        src = src.crop((cx, cy, src.width, src.height))
+    dst.alpha_composite(src, (x + cx, y + cy))
+
+
 def texture_image(sprite) -> Optional[Image.Image]:
     try:
         tex = sprite.m_RD.texture.read()
@@ -422,16 +398,21 @@ def rebuild_part(part: Part) -> Optional[Image.Image]:
         part._image = tex
         return tex
 
+    def fall_back(img):
+        """Keep the plain texture when the mesh cannot be used."""
+        part._image = img
+        return img
+
     try:
         handler = MeshHandler(part.mesh)
         handler.process()
     except Exception:
-        return tex
+        return fall_back(tex)
 
     verts = handler.m_Vertices or []
     uvs = handler.m_UV0 or []
     if not verts or not uvs or len(verts) != len(uvs):
-        return tex
+        return fall_back(tex)
 
     tris = []
     try:
@@ -440,13 +421,13 @@ def rebuild_part(part: Part) -> Optional[Image.Image]:
     except Exception:
         tris = []
     if not tris:
-        return tex
+        return fall_back(tex)
 
     max_x = int(max(v[0] for v in verts)) + 1
     max_y = int(max(v[1] for v in verts)) + 1
     width, height = max_x, max_y
     if width <= 0 or height <= 0:
-        return tex
+        return fall_back(tex)
 
     tw, th = tex.size
     out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -477,68 +458,119 @@ def rebuild_part(part: Part) -> Optional[Image.Image]:
         if crop.size != (dw, dh):
             crop = crop.resize((dw, dh), Image.LANCZOS)
         # mesh coordinates are y-up, images are y-down
-        dest_y = height - 1 - y1
-        if dest_y < 0 or dest_y + dh > height:
-            continue
-        out.alpha_composite(crop, (x0, dest_y))
+        blend(out, crop, x0, height - 1 - y1)
     part._image = out
     return out
 
 
-def select_parts(analysis: Analysis) -> List[Part]:
-    """All painting layers of the prefab (background, character, overlays)."""
-    return list(analysis.parts)
-
-
-def layout(analysis: Analysis, scale: float) -> Tuple[int, int, V2]:
-    """Canvas size and origin for the given render scale."""
-    items = [p for p in analysis.parts]
+def _bounds(analysis: Analysis) -> Tuple[float, float, float, float]:
+    """Bounding box of every layer in UI space: (left, bottom, right, top)."""
+    items: List = list(analysis.parts)
     if analysis.face is not None:
-        items = items + [analysis.face]
+        items.append(analysis.face)
     left = min(i.paste.x for i in items)
     bottom = min(i.paste.y for i in items)
     right = max(i.paste.x + i.size.x for i in items)
     top = max(i.paste.y + i.size.y for i in items)
-    w = max(1, int(round((right - left) * scale)))
-    h = max(1, int(round((top - bottom) * scale)))
-    return w, h, V2(left, bottom)
+    return left, bottom, right, top
 
 
-def auto_scale(analysis: Analysis) -> float:
-    """Scale that renders the painting at its native texture resolution."""
-    root = next((p for p in analysis.parts if p.go_name == analysis.root_name), None)
-    if root is None or root.size.x <= 0:
-        return 1.0
-    return min(1.0, analysis.canvas[0] / root.size.x)
+def _root_part(analysis: Analysis) -> Optional[Part]:
+    return next((p for p in analysis.parts if p.go_name == analysis.root_name), None)
+
+
+# 输出尺寸与原生纹理相差不超过这个像素数时，直接取纹理尺寸（避免莫名多出 1px）
+CANVAS_SNAP = 2
+# 声明尺寸与图层矩形的长宽比偏差超过这个比例，就认为 mRawSpriteSize 不可信
+ASPECT_TOLERANCE = 0.10
+# 极端 prefab 的兜底上限：正常立绘远小于此值，触发时说明布局异常
+MAX_RENDER_PIXELS = 36_000_000
+
+
+def fit(analysis: Analysis, native: bool = True) -> Tuple[float, int, int, V2]:
+    """输出帧：(scale, w, h, origin)。
+
+    ``native=True``（默认）原生纹理 1:1：主图层的「UI 单位 → 像素」比例由它自己的
+    原始纹理宽度决定，画布吸附到纹理尺寸，整体不放大不缩小。
+    ``native=False`` 游戏布局：按 prefab 的 UI 坐标 1:1 输出，画面更大，但背景是
+    小纹理上采样得到（详见 README 的「两种输出尺寸」）。
+    """
+    left, bottom, right, top = _bounds(analysis)
+    raw_w = max(1.0, right - left)
+    raw_h = max(1.0, top - bottom)
+
+    if not native:
+        scale = 1.0
+        pixels = raw_w * raw_h
+        if pixels > MAX_RENDER_PIXELS:  # pragma: no cover - 布局异常时的兜底
+            scale = (MAX_RENDER_PIXELS / pixels) ** 0.5
+        w = max(1, int(round(raw_w * scale)))
+        h = max(1, int(round(raw_h * scale)))
+        return scale, w, h, V2(left, bottom)
+
+    root = _root_part(analysis)
+    if root is not None and root.size.x > 0:
+        scale = analysis.canvas[0] / root.size.x
+    else:
+        scale = 1.0
+    w = max(1, int(round(raw_w * scale)))
+    h = max(1, int(round(raw_h * scale)))
+    cw, ch = analysis.canvas
+    if abs(w - cw) <= CANVAS_SNAP:
+        w = cw
+    if abs(h - ch) <= CANVAS_SNAP:
+        h = ch
+    pixels = w * h
+    if pixels > MAX_RENDER_PIXELS:  # pragma: no cover - 布局异常时的兜底
+        k = (MAX_RENDER_PIXELS / pixels) ** 0.5
+        scale *= k
+        w = max(1, int(w * k))
+        h = max(1, int(h * k))
+    return scale, w, h, V2(left, bottom)
 
 
 def pad_to_raw(part: Part, img: Image.Image) -> Image.Image:
+    """把网格图垫到 sprite 声明尺寸，使它在图层矩形里对齐。
+
+    只有「声明尺寸比网格图大、且长宽比与图层矩形一致」时才垫：正常立绘的贴图边缘
+    会多出几十像素，这一垫能让图层在矩形里对齐。个别 prefab（如 i404 的背景层）
+    把几个不同网格的 ``mRawSpriteSize`` 写成同一个值，长宽比与矩形明显不符；这时
+    按网格图原样使用，否则会被垫到错误画布再缩放，导致整层错位或出现空洞。
+    """
     tw = max(1, int(round(part.raw_size.x)))
     th = max(1, int(round(part.raw_size.y)))
     if img.width >= tw and img.height >= th:
         return img
+    rect_aspect = part.size.x / part.size.y if part.size.y else 0.0
+    if rect_aspect > 0 and abs((tw / th) / rect_aspect - 1.0) > ASPECT_TOLERANCE:
+        return img
     canvas = Image.new("RGBA", (max(tw, img.width), max(th, img.height)), (0, 0, 0, 0))
     # ALPA pads in y-up space, which is the bottom of the final image
-    canvas.alpha_composite(img, (0, canvas.height - img.height))
+    blend(canvas, img, 0, canvas.height - img.height)
     return canvas
 
 
-MAX_RENDER_PIXELS = 36_000_000
+def layer_size(part: Part, scale: float) -> Tuple[int, int]:
+    """像素尺寸：布局比例换算后，与纹理尺寸相差 2px 内时直接用纹理尺寸。
+
+    立绘 prefab 的 RectTransform 与贴图尺寸常常差零点几像素，直接按布局换算
+    会让整层被 LANCZOS 重采样一遍（2048→2047 这种），这里吸附回纹理尺寸，
+    让图层保持 1:1；只有真正的缩放层（如 _rw 人物层）才会重采样。
+    """
+    dw = max(1, int(round(part.size.x * scale)))
+    dh = max(1, int(round(part.size.y * scale)))
+    tw = max(1, int(round(part.raw_size.x)))
+    th = max(1, int(round(part.raw_size.y)))
+    if abs(dw - tw) <= CANVAS_SNAP:
+        dw = tw
+    if abs(dh - th) <= CANVAS_SNAP:
+        dh = th
+    return dw, dh
 
 
-def effective_scale(analysis: Analysis, scale: float) -> float:
-    """Clamp absurd canvases (some prefabs use a 8k+ layout canvas)."""
-    w, h, _ = layout(analysis, scale)
-    pixels = w * h
-    if pixels <= MAX_RENDER_PIXELS:
-        return scale
-    return scale * (MAX_RENDER_PIXELS / pixels) ** 0.5
-
-
-def compose_base(analysis: Analysis, scale: float = 1.0) -> Optional[Image.Image]:
-    """Compose every painting layer in UI layout space (ALPA compatible)."""
-    scale = effective_scale(analysis, scale)
-    w, h, origin = layout(analysis, scale)
+def compose_base(analysis: Analysis, native: bool = True) -> Optional[Image.Image]:
+    """Compose every painting layer, at native texture size or game layout size."""
+    scale, w, h, origin = fit(analysis, native)
     canvas = Image.new("RGBA", (w, h), (255, 255, 255, 0))
     used = 0
     for part in analysis.parts:
@@ -546,51 +578,52 @@ def compose_base(analysis: Analysis, scale: float = 1.0) -> Optional[Image.Image
         if img is None:
             continue
         img = pad_to_raw(part, img)
-        dw = max(1, int(round(part.size.x * scale)))
-        dh = max(1, int(round(part.size.y * scale)))
+        dw, dh = layer_size(part, scale)
         if img.size != (dw, dh):
             img = img.resize((dw, dh), Image.LANCZOS)
         x = int(round((part.paste.x - origin.x) * scale))
         y = int(round((part.paste.y - origin.y) * scale))
-        canvas.alpha_composite(img, (x, h - y - dh))
+        blend(canvas, img, x, h - y - dh)
         used += 1
     if used == 0:
         return None
     return canvas
 
 
-def face_layout(analysis: Analysis, scale: float, offset: Tuple[int, int] = (0, 0)):
+def face_layout(analysis: Analysis, offset: Tuple[int, int] = (0, 0),
+                native: bool = True):
     """Where the face patch goes: (x, y, w, h, canvas_w, canvas_h) in image pixels.
 
     ``offset`` is (right, up) in final-image pixels, matching ALPA's spinner
-    semantics (纵向 +1 表示往上一个像素)。
+    semantics (纵向 +1 表示往上一个像素)。坐标可能为负，绘制时由 ``blend`` 裁剪。
     """
     if analysis.face is None:
         return None
-    scale = effective_scale(analysis, scale)
-    w, h, origin = layout(analysis, scale)
+    scale, w, h, origin = fit(analysis, native)
     slot = analysis.face
     dw = max(1, int(round(slot.size.x * scale)))
     dh = max(1, int(round(slot.size.y * scale)))
     x = int(round((slot.paste.x - origin.x) * scale)) + int(offset[0])
-    y = int(round((slot.paste.y - origin.y) * scale)) - int(offset[1])
+    # +offset[1] 表示往上：paste 是 y-up 坐标，值越大在图片里越靠上
+    y = int(round((slot.paste.y - origin.y) * scale)) + int(offset[1])
     return x, h - y - dh, dw, dh, w, h
 
 
-def compose_face(analysis: Analysis, face_img: Image.Image, scale: float = 1.0,
-                 crop: bool = False, base: Optional[Image.Image] = None,
-                 offset: Tuple[int, int] = (0, 0)) -> Optional[Image.Image]:
+def compose_face(analysis: Analysis, face_img: Image.Image, crop: bool = False,
+                 base: Optional[Image.Image] = None,
+                 offset: Tuple[int, int] = (0, 0),
+                 native: bool = True) -> Optional[Image.Image]:
     if base is None:
-        base = compose_base(analysis, scale)
+        base = compose_base(analysis, native)
     if base is None or analysis.face is None or face_img is None:
         return base
-    rect = face_layout(analysis, scale, offset)
+    rect = face_layout(analysis, offset, native)
     if rect is None:
         return base
     x, y, dw, dh, _, _ = rect
     img = face_img if face_img.size == (dw, dh) else face_img.resize((dw, dh), Image.LANCZOS)
     out = base.copy()
-    out.alpha_composite(img, (x, y))
+    blend(out, img, x, y)
     if crop:
         out = crop_alpha(out)
     return out
@@ -598,87 +631,75 @@ def compose_face(analysis: Analysis, face_img: Image.Image, scale: float = 1.0,
 
 def crop_alpha(img: Image.Image) -> Image.Image:
     bbox = img.getbbox()
-    if bbox and bbox[0] >= 0:
-        return img.crop(bbox)
-    return img
+    return img.crop(bbox) if bbox else img
 
 
 # ---------------------------------------------------------------- faces
-FACE_SPLIT_RE = re.compile(r"^(.+?)(_[hg]\d*|_alter|_younv|_n|_rw\d*|_bj\d*|_hei|_wjz|_doa|_idol|_front|_mid|_tolove|_shophx|_buildhx|_\d+|_ex|_tx\d+|_jz\d*|_renwu|_memory|_wjz)+$")
-
-
 def face_bundle_name(painting: str) -> str:
     """Port of ALPA's rule: take first two '_' chunks, drop a trailing _n."""
-    chunks = painting.split("_", 2)
-    base = "_".join(chunks[:2]) if len(chunks) > 1 else chunks[0]
-    base = base.replace("_n", "")
-    return base
+    base = "_".join(painting.split("_", 2)[:2])
+    return re.sub(r"_n$", "", base)
 
 
-def load_faces(source: AssetSource, painting: str) -> List[Tuple[str, Image.Image]]:
-    names = [face_bundle_name(painting)]
-    if names[0] != painting:
-        names.append(painting)
-    for candidate in names:
-        path = source.bundle_path("paintingface/" + candidate)
-        if not os.path.isfile(path):
-            continue
-        try:
-            env = UnityPy.load(path)
-        except Exception:
-            continue
-        out: List[Tuple[str, Image.Image]] = []
-        for o in env.objects:
-            if o.type.name != "Sprite":
-                continue
-            try:
-                spr = o.read()
-                img = sprite_image(spr)
-            except Exception:
-                continue
-            if img is not None:
-                out.append((spr.m_Name, img))
-        if out:
-            out.sort(key=lambda item: face_sort_key(item[0]))
-            return out
-    return []
-
-
-def count_faces(root: str, painting: str) -> int:
-    """Number of expression sprites in the matching paintingface bundle."""
+def _face_bundle(root: str, painting: str) -> Optional[str]:
+    """Path of the paintingface bundle matching this painting, if present."""
     for candidate in (face_bundle_name(painting), painting):
         path = os.path.join(root, "paintingface", candidate)
-        if not os.path.isfile(path):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def load_faces(source: AssetSource, painting: str,
+               wanted: Optional[set] = None) -> List[Tuple[str, Image.Image]]:
+    """Expression sprites of a painting, sorted by expression number.
+
+    ``wanted`` skips decoding sprites we are not going to write out — the
+    texture decode is the expensive part of an export.
+    """
+    path = _face_bundle(source.root, painting)
+    if path is None:
+        return []
+    try:
+        env = UnityPy.load(path)
+    except Exception:
+        return []
+    out: List[Tuple[str, Image.Image]] = []
+    for o in env.objects:
+        if o.type.name != "Sprite":
             continue
         try:
-            env = UnityPy.load(path)
-            return sum(1 for o in env.objects if o.type.name == "Sprite")
+            spr = o.read()
+            if wanted is not None and spr.m_Name not in wanted:
+                continue
+            img = sprite_image(spr)
         except Exception:
-            return 0
-    return 0
+            continue
+        if img is not None:
+            out.append((spr.m_Name, img))
+    out.sort(key=lambda item: face_sort_key(item[0]))
+    return out
 
 
 def face_names_in_bundle(root: str, painting: str) -> List[str]:
     """Expression sprite names of the matching paintingface bundle (sorted)."""
-    for candidate in (face_bundle_name(painting), painting):
-        path = os.path.join(root, "paintingface", candidate)
-        if not os.path.isfile(path):
-            continue
-        try:
-            env = UnityPy.load(path)
-            names: List[str] = []
-            for obj in env.objects:
-                if obj.type.name != "Sprite":
-                    continue
-                try:
-                    names.append(obj.read().m_Name)
-                except Exception:
-                    continue
-            names.sort(key=face_sort_key)
-            return names
-        except Exception:
-            return []
-    return []
+    path = _face_bundle(root, painting)
+    if path is None:
+        return []
+    try:
+        env = UnityPy.load(path)
+        names = []
+        for obj in env.objects:
+            if obj.type.name != "Sprite":
+                continue
+            try:
+                names.append(obj.read().m_Name)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    names.sort(key=face_sort_key)
+    return names
 
 
 def face_sort_key(name: str):
@@ -716,28 +737,23 @@ def sprite_image(sprite) -> Optional[Image.Image]:
 def export_painting(source: AssetSource, painting: str, out_dir: str,
                     export_faces: bool = True, export_parts: bool = False,
                     crop: bool = False, png_level: int = 6,
-                    native_scale: bool = True,
+                    native: bool = True,
                     face_names: Optional[List[str]] = None,
                     face_offset: Tuple[int, int] = (0, 0),
-                    first_face_only: bool = False,
                     export_base: bool = False,
-                    overwrite: bool = True) -> List[str]:
-    """Export one painting.
+                    overwrite: bool = True) -> Tuple[List[str], int]:
+    """Export one painting at native texture resolution.
 
     ``face_names`` selects what to write: ``"0"`` means the expression-free
     base image, ``"1"``/``"2"``… are the expression files, an empty list
     falls back to the base image.  ``None`` keeps the batch behaviour (all
     expressions); ``export_base`` forces the base on top of that.
+
+    Returns ``(written files, number of files skipped because they existed)``.
     """
     analysis = analyze(source, "painting/" + painting)
-    scale = auto_scale(analysis) if native_scale else 1.0
-    saved: List[str] = []
-    faces = load_faces(source, painting) if export_faces else []
     wanted = None if face_names is None else {str(n) for n in face_names}
-    if wanted is not None:
-        faces = [(n, img) for n, img in faces if n in wanted]
-    elif first_face_only:
-        faces = faces[:1]
+    faces = load_faces(source, painting, wanted) if export_faces else []
 
     if export_base or not export_faces:
         want_base = True
@@ -746,45 +762,50 @@ def export_painting(source: AssetSource, painting: str, out_dir: str,
     else:
         want_base = "0" in wanted or not wanted
     if not want_base and not faces:
-        return []
+        return [], 0
 
     os.makedirs(out_dir, exist_ok=True)
     painting_dir = os.path.join(out_dir, painting)
     os.makedirs(painting_dir, exist_ok=True)
-    base = compose_base(analysis, scale)
+
+    saved: List[str] = []
+    skipped = 0
+
+    def write(img: Image.Image, path: str) -> None:
+        nonlocal skipped
+        if not overwrite and os.path.isfile(path):
+            skipped += 1
+            return
+        img.save(path, compress_level=png_level)
+        saved.append(path)
+
+    base = compose_base(analysis, native)
     if base is None:
         raise RuntimeError("立绘为空（贴图或网格缺失）")
     if want_base:
-        path = os.path.join(painting_dir, painting + ".png")
-        if overwrite or not os.path.isfile(path):
-            (crop_alpha(base) if crop else base).save(path, compress_level=png_level)
-            saved.append(path)
+        write(crop_alpha(base) if crop else base, os.path.join(painting_dir, painting + ".png"))
 
-    if faces:
-        face_dir = painting_dir
-        for name, img in faces:
-            out = compose_face(analysis, img, scale, crop, base=base, offset=face_offset)
-            if out is None:
-                continue
-            path = os.path.join(face_dir, f"{painting}_{safe_name(name)}.png")
-            if not overwrite and os.path.isfile(path):
-                continue
-            out.save(path, compress_level=png_level)
-            saved.append(path)
+    for name, img in faces:
+        out = compose_face(analysis, img, crop, base=base, offset=face_offset, native=native)
+        if out is not None:
+            write(out, os.path.join(painting_dir, f"{painting}_{safe_name(name)}.png"))
 
     if export_parts:
         parts_dir = os.path.join(painting_dir, "parts")
         os.makedirs(parts_dir, exist_ok=True)
+        seen: Dict[str, int] = {}
         for p in analysis.parts:
             img = rebuild_part(p)
             if img is None:
                 continue
-            path = os.path.join(parts_dir, f"{safe_name(p.name)}.png")
-            img.save(path, compress_level=png_level)
-            saved.append(path)
+            # several layers can share a sprite name; keep them apart
+            stem = safe_name(p.name) or "part"
+            seen[stem] = seen.get(stem, 0) + 1
+            if seen[stem] > 1:
+                stem = f"{stem}_{seen[stem]}"
+            write(img, os.path.join(parts_dir, stem + ".png"))
 
-    analysis.env = None
-    return saved
+    return saved, skipped
 
 
 def safe_name(name: str) -> str:

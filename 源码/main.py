@@ -7,12 +7,15 @@ Merges the three tools of the classic workflow into a single application:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing
 import os
+import re
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from PIL import Image
 from PySide6.QtCore import QRectF, QSettings, QSize, Qt, QThread, QTimer, Signal
@@ -39,7 +42,6 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -53,9 +55,9 @@ import worker
 from core import AssetSource, face_bundle_name
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 
-STATUS_IDLE = "未导出"
+STATUS_QUEUED = "排队中"
 STATUS_DONE = "已完成"
 STATUS_FAIL = "失败"
 STATUS_SKIP = "已存在"
@@ -121,7 +123,7 @@ class FaceCountWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
-        buffer: dict[str, int] = {}
+        buffer: dict[str, list[str]] = {}
         for name in self.names:
             if self._stop:
                 break
@@ -469,7 +471,7 @@ class MainWindow(QMainWindow):
         grid1 = QHBoxLayout()
         grid1.addWidget(QLabel("分辨率"))
         self.cb_scale = QComboBox()
-        self.cb_scale.addItems(["原始纹理（推荐）", "游戏布局（更大）"])
+        self.cb_scale.addItems(["原始纹理", "游戏布局"])
         self.cb_scale.setMinimumWidth(130)
         grid1.addWidget(self.cb_scale)
         grid1.addSpacing(10)
@@ -705,7 +707,9 @@ class MainWindow(QMainWindow):
         self.chk_parts.setChecked(self.settings.value("parts", False, bool))
         self.chk_crop.setChecked(self.settings.value("crop", False, bool))
         self.chk_skip.setChecked(self.settings.value("skip", True, bool))
-        self.cb_scale.setCurrentIndex(int(self.settings.value("scale", 0)))
+        # 默认「游戏布局」；换用新键名，避免旧版本存下的 scale=0 覆盖新默认值
+        idx = int(self.settings.value("scale_mode", 1))
+        self.cb_scale.setCurrentIndex(idx if 0 <= idx < self.cb_scale.count() else 1)
         if root:
             self._set_root(root, reload_list=True)
         if out:
@@ -721,7 +725,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("parts", self.chk_parts.isChecked())
         self.settings.setValue("crop", self.chk_crop.isChecked())
         self.settings.setValue("skip", self.chk_skip.isChecked())
-        self.settings.setValue("scale", self.cb_scale.currentIndex())
+        self.settings.setValue("scale_mode", self.cb_scale.currentIndex())
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._save_settings()
@@ -751,13 +755,19 @@ class MainWindow(QMainWindow):
 
     def _set_root(self, path: str, reload_list: bool = False) -> None:
         changed = path != self.root
+        if path and not os.path.isdir(os.path.join(path, "painting")):
+            self._log(f"[警告] {path} 下没有 painting 文件夹，请确认选择的是 AssetBundles 根目录")
+            self.lbl_source_info.setText("目录无效")
+            # never keep a broken root: the list would still show the previous
+            # folder's paintings and every export would fail
+            self.root = ""
+            self.ed_root.setText(path)
+            self._reload_list()
+            return
         self.root = path
         self.ed_root.setText(path)
         if not path:
-            return
-        if not os.path.isdir(os.path.join(path, "painting")):
-            self._log(f"[警告] {path} 下没有 painting 文件夹，请确认选择的是 AssetBundles 根目录")
-            self.lbl_source_info.setText("目录无效")
+            self._reload_list()
             return
         n = len(AssetSource.list_paintings_static(path))
         self.lbl_source_info.setText(f"{n} 个立绘资源")
@@ -954,9 +964,9 @@ class MainWindow(QMainWindow):
                 continue
             if mode == 2 and not name.endswith("_rw"):
                 continue
-            if mode == 3 and not re_search(name, "_n"):
+            if mode == 3 and not name.endswith("_n"):
                 continue
-            if mode == 4 and re_search(name, r"_(bj|jz|tx)\d*$"):
+            if mode == 4 and re.search(r"_(bj|jz|tx)\d*$", name):
                 continue
             out.append(name)
         return out
@@ -1002,9 +1012,7 @@ class MainWindow(QMainWindow):
 
     def _update_count(self) -> None:
         total = len(self.checked)
-        if hasattr(self, "btn_only_checked"):
-            self.btn_only_checked.setText("已勾选")
-            self.btn_only_checked.setToolTip(f"只看已经勾选的立绘（{total} 个），再点一次恢复全部")
+        self.btn_only_checked.setToolTip(f"只看已经勾选的立绘（{total} 个），再点一次恢复全部")
         self.lbl_count.setText(f"已选 {total}/{len(self.rows)} 项")
 
     def _on_only_checked(self, enabled: bool) -> None:
@@ -1202,9 +1210,6 @@ class MainWindow(QMainWindow):
         self.sp_off_x.setValue(0)
         self.sp_off_y.setValue(0)
 
-    def _first_face(self) -> str | None:
-        return self._face_names[0] if self._face_names else None
-
     def _faces_select_all(self) -> None:
         self._set_all_faces(True)
 
@@ -1335,7 +1340,7 @@ class MainWindow(QMainWindow):
                 self.done_jobs += 1
                 continue
             self.futures[fut] = name
-            self._set_status(name, "排队中", "")
+            self._set_status(name, STATUS_QUEUED, "")
 
         self._update_progress()
         if not self.futures:
@@ -1379,8 +1384,9 @@ class MainWindow(QMainWindow):
                 result = fut.result()
             except Exception as exc:  # noqa: BLE001
                 result = {"name": name, "ok": False, "error": str(exc), "seconds": 0}
-            if result.get("ok") and result.get("count", 1) == 0:
-                self._set_status(name, STATUS_SKIP, "无匹配表情")
+            if result.get("ok") and not result.get("count"):
+                skipped = result.get("skipped", 0)
+                self._set_status(name, STATUS_SKIP, f"已存在 {skipped}" if skipped else "无匹配表情")
                 self.skipped_jobs += 1
             elif result.get("ok"):
                 self._set_status(name, STATUS_DONE, f"{result.get('seconds', 0)}s")
@@ -1448,7 +1454,7 @@ class MainWindow(QMainWindow):
             STATUS_DONE: "#1f9d55",
             STATUS_FAIL: "#c0392b",
             STATUS_SKIP: "#8a93a8",
-            "排队中": "#8a93a8",
+            STATUS_QUEUED: "#8a93a8",
         }.get(text, "#1f2430")
         cell.setForeground(QColor(color))
         tip = f"{name}\n{text}" + (f" · {extra}" if extra else "")
@@ -1517,7 +1523,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "使用说明",
-            "1. 素材根目录选择碧蓝航线的 AssetBundles 文件夹（包含 painting、paintingface、dependencies）。\n"
+            "1. 素材根目录选择碧蓝航线的 AssetBundles 文件夹（包含 painting、paintingface、dependencies，"
+            "以及 ui\\commonui_atlas）。\n"
             "2. 导出目录选择保存位置。\n"
             "3. 在左侧列表中勾选要导出的立绘（可用搜索/筛选快速定位，例如只看 _rw）。\n"
             "4. 右侧“差分表情”里会列出该立绘的全部表情：\n"
@@ -1530,7 +1537,7 @@ class MainWindow(QMainWindow):
             "   没有勾选任何立绘时，会直接导出你当前预览的那一个。\n"
             "6. 工具条“已勾选”可以只看已勾选的立绘，方便导出前核对清单。\n\n"
             "提示：\n"
-            "· “原始纹理”按素材原尺寸输出，“游戏布局”按游戏内 UI 坐标输出（更大）。\n"
+            "· “游戏布局”按游戏内 UI 坐标输出（默认）；“原始纹理”按素材原生尺寸输出。\n"
             "· PNG 压缩默认 0（不压缩、保存最快），需要小体积可调到 6～9。\n"
             "· 首次导出请先小批量验证；失败项会在日志中给出原因。\n"
             "· 勾选“跳过已存在的文件”可断点续跑：只跳过已存在的单个文件，缺哪个补哪个。",
@@ -1547,12 +1554,6 @@ class MainWindow(QMainWindow):
             "· AzurLanePaintingAnalysis-Kt（布局合成与差分表情）<br><br>"
             "三者均为 MIT 许可的开源项目，本项目基于其算法重新实现。",
         )
-
-
-def re_search(name: str, pattern: str) -> bool:
-    import re
-
-    return re.search(pattern, name) is not None
 
 
 def format_duration(seconds: float) -> str:
@@ -1583,9 +1584,6 @@ def main() -> int:
 
 
 def run_diag(argv: list[str]) -> int:
-    import argparse
-    import traceback
-
     parser = argparse.ArgumentParser(prog="diag")
     parser.add_argument("--diag", action="store_true")
     parser.add_argument("--root", required=True)
@@ -1597,9 +1595,8 @@ def run_diag(argv: list[str]) -> int:
         print("UnityPy", UnityPy.__version__)
         src = AssetSource(args.root)
         print("deps", len(src.table))
-        analysis = __import__("core").analyze(src, "painting/" + args.name)
+        analysis = core.analyze(src, "painting/" + args.name)
         print("parts", [(p.name, p.size) for p in analysis.parts])
-        import core
 
         for p in analysis.parts:
             tex = p.sprite.m_RD.texture.read()
@@ -1610,8 +1607,6 @@ def run_diag(argv: list[str]) -> int:
             print("part", None if part is None else part.size)
 
         # frozen multiprocessing / preview path
-        from concurrent.futures import ProcessPoolExecutor
-
         with ProcessPoolExecutor(max_workers=1, initializer=worker.init, initargs=(args.root,)) as pool:
             res = pool.submit(worker.preview_job, {"root": args.root, "name": args.name}).result()
         print("preview", res.get("ok"), res.get("width"), res.get("height"), len(res.get("png") or b""), res.get("error"))
@@ -1624,8 +1619,6 @@ def run_diag(argv: list[str]) -> int:
 
 
 def run_cli(argv: list[str]) -> int:
-    import argparse
-
     parser = argparse.ArgumentParser(prog="AzurLanePaintingExport", description="批处理导出（无界面）")
     parser.add_argument("--cli", action="store_true")
     parser.add_argument("--root", required=True, help="AssetBundles 根目录")
@@ -1637,8 +1630,9 @@ def run_cli(argv: list[str]) -> int:
     parser.add_argument("--face-names", default="", help="只导出指定差分表情，逗号分隔，例如 3 或 1,3,5")
     parser.add_argument("--parts", action="store_true", help="额外导出各部件")
     parser.add_argument("--base", action="store_true", help="同时导出无表情底图")
+    parser.add_argument("--ui-scale", action="store_true",
+                        help="按游戏布局尺寸输出（放大版，背景为上采样）")
     parser.add_argument("--crop", action="store_true", help="裁剪透明边")
-    parser.add_argument("--ui-scale", action="store_true", help="按游戏布局尺寸输出")
     parser.add_argument("--level", type=int, default=0, help="PNG 压缩等级 0-9（默认 0 不压缩）")
     args = parser.parse_args(argv[1:])
 
@@ -1662,7 +1656,6 @@ def run_cli(argv: list[str]) -> int:
     started = time.time()
     with ProcessPoolExecutor(max_workers=args.workers, initializer=worker.init, initargs=(args.root,)) as pool:
         futures = {pool.submit(worker.export_job, dict(opts, name=n)): n for n in names}
-        from concurrent.futures import as_completed
 
         for i, fut in enumerate(as_completed(futures), 1):
             result = fut.result()

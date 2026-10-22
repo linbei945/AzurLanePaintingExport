@@ -1,0 +1,5 @@
+@echo off
+rem Run from source. Requires: pip install -r requirements.txt
+cd /d "%~dp0"
+python main.py %*
+if errorlevel 1 pause
