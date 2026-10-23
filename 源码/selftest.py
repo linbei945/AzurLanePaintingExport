@@ -141,6 +141,18 @@ def _face_dir(bundles):
     return root
 
 
+def test_face_bundle_exists_is_cheap():
+    # 列表刷行只用文件判断，绝不能触发 prefab 解析（否则 4000 多行要卡一分半）
+    root = _face_dir(["2b"])
+    try:
+        with patch(core={"analyze": lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该解析 prefab"))}):
+            assert core.face_bundle_exists(root, "2b_n") is True
+            assert core.face_bundle_exists(root, "2b_hx") is True
+            assert core.face_bundle_exists(root, "nonexistent_2") is False
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_face_bundle_path_prefers_exact():
     # 同名 bundle 存在时必须用它，不能回退到本体（这就是 tiancheng_cv_2 花脸的原因）
     root = _face_dir(["tiancheng_cv", "tiancheng_cv_2", "tiancheng"])
@@ -167,10 +179,21 @@ def test_face_bundle_path_n_marker_is_direct():
 def test_face_bundle_path_rejects_other_skin():
     # 只剩别人的 bundle，且脸槽对不上 -> 宁可没有表情，也不能套别人的脸
     root = _face_dir(["tiancheng_cv"])
-    slots = {"painting/tiancheng_cv_2": (184, 184), "painting/tiancheng_cv": (90, 96)}
+    slots = {"tiancheng_cv_2": (184, 184), "tiancheng_cv": (90, 96)}
     try:
         with patch(core={"face_slot_size": lambda r, n: slots.get(n)}):
             assert core.face_bundle_path(root, "tiancheng_cv_2", (184, 184)) is None
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_face_bundle_path_keeps_unknown():
+    # 拿不到对方脸槽（本体 prefab 不在这个版本里 / 不是 prefab）时沿用旧行为，不白丢表情
+    root = _face_dir(["npcgangyishawa_2"])
+    try:
+        with patch(core={"face_slot_size": lambda r, n: (146, 136) if n.endswith("_n_hx") else None}):
+            got = core.face_bundle_path(root, "npcgangyishawa_2_n_hx")
+        assert os.path.basename(got) == "npcgangyishawa_2", got
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

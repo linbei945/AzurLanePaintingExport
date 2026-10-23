@@ -52,10 +52,10 @@ from PySide6.QtWidgets import (
 
 import core
 import worker
-from core import AssetSource, face_bundle_path
+from core import AssetSource, face_bundle_exists
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 
 # 表情 bundle 解析规则版本：改动候选命名规则时 +1，让旧的表情计数缓存失效
 FACE_RULE_VERSION = 2
@@ -819,7 +819,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(names))
         pending: list[str] = []
         for row, name in enumerate(names):
-            has_bundle = face_bundle_path(self.root, name) is not None
+            has_bundle = face_bundle_exists(self.root, name)
             self.faces_available[name] = 1 if has_bundle else 0
             if not has_bundle:
                 self.face_names_cache[name] = []
@@ -932,7 +932,7 @@ class MainWindow(QMainWindow):
             cell = self.table.item(row, 1)
             if cell is None:
                 continue
-            has_bundle = face_bundle_path(self.root, name) is not None
+            has_bundle = face_bundle_exists(self.root, name)
             cell.setText(self._face_text(count, has_bundle))
             cell.setForeground(QColor("#2f6fed") if count else QColor("#8a93a8"))
         self.table.setUpdatesEnabled(True)

@@ -731,6 +731,17 @@ def _same_slot(a, b) -> bool:
     return all(abs(x - y) <= max(1, round(y * 0.03)) for x, y in zip(a, b))
 
 
+def face_bundle_exists(root: str, painting: str) -> bool:
+    """只判断 paintingface 里有没有候选文件。
+
+    列表刷 4000 多行时用这个：``face_bundle_path`` 为了确认是同一张脸要去解析
+    prefab 的脸槽，单个几十到上百毫秒，全量跑一遍要一分半以上，会把窗口卡死。
+    """
+    folder = os.path.join(root, "paintingface")
+    return any(os.path.isfile(os.path.join(folder, c))
+               for c in face_bundle_candidates(painting))
+
+
 def face_bundle_path(root: str, painting: str,
                      slot: Optional[Tuple[int, int]] = None) -> Optional[str]:
     """paintingface 里与该立绘匹配的 bundle 路径，没有则 ``None``。
@@ -738,20 +749,26 @@ def face_bundle_path(root: str, painting: str,
     同名 / ``_n`` / ``_hx`` 是同一人物的差分，可以直接换算；再往宽泛回退时
     必须核对表情槽尺寸——不同皮肤（``tiancheng_cv_2`` 与 ``tiancheng_cv``）
     脸槽大小不同，套用别人的表情就是花脸。
+
+    只有「两边脸槽都拿得到且明显不一致」才判定为不匹配；拿不到（对方 prefab
+    不在这个版本里、或本身不是 prefab）时按原来的行为沿用，避免平白丢掉表情。
     """
     base, tokens = _split_face_markers(painting)
     direct = {painting}
     if "_n" in tokens:
         direct.add(base + "".join(t for t in tokens if t != "_n"))
 
+    mine = slot
     for candidate in face_bundle_candidates(painting):
         path = os.path.join(root, "paintingface", candidate)
         if not os.path.isfile(path):
             continue
         if candidate in direct:
             return path
-        mine = slot if slot is not None else face_slot_size(root, painting)
-        if _same_slot(mine, face_slot_size(root, candidate)):
+        if mine is None:
+            mine = face_slot_size(root, painting)
+        theirs = face_slot_size(root, candidate)
+        if mine is None or theirs is None or _same_slot(mine, theirs):
             return path
     return None
 
