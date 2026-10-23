@@ -116,20 +116,74 @@ def make_analysis(parts, face=None, canvas=(1920, 1080), root_name="root"):
 
 
 # ---------------------------------------------------------------- tests
-def test_face_bundle_name():
+def test_face_bundle_candidates():
     cases = {
-        "aogusite_4_n": "aogusite_4",
-        "hailunna_n": "hailunna",
-        "nanning_n": "nanning",
-        "2b": "2b",
-        "2b_rw": "2b_rw",
-        "xin_n_1": "xin",          # 前两段拼成 xin_n，尾部 _n 仍要去掉
-        "ab_nx_1": "ab_nx",        # 中间的 _n 不能删（旧实现会变成 abx）
-        "n_n_x": "n",              # 拼出的 n_n 以 _n 结尾，按规则去掉
+        # 关键回归：三段式皮肤名不能塌成前两段（tiancheng_cv_2 不是 tiancheng_cv）
+        "tiancheng_cv_2": ["tiancheng_cv_2", "tiancheng_cv", "tiancheng"],
+        "tiancheng_cv_h_n": ["tiancheng_cv_h_n", "tiancheng_cv_h", "tiancheng_cv", "tiancheng"],
+        "2b": ["2b"],
+        "2b_n": ["2b_n", "2b"],                 # _n = 无装备，直接共用本体表情
+        "2b_hx": ["2b_hx", "2b"],
+        "2b_n_hx": ["2b_n_hx", "2b_hx", "2b"],  # _hx 自带表情组时优先用它
+        "xin_n_1": ["xin_n_1", "xin_n", "xin"],  # 尾部不是标记，只能逐段回退
+        "n_n_x": ["n_n_x", "n_n", "n"],
     }
     for src, want in cases.items():
-        got = core.face_bundle_name(src)
+        got = core.face_bundle_candidates(src)
         assert got == want, f"{src} -> {got}，期望 {want}"
+
+
+def _face_dir(bundles):
+    root = tempfile.mkdtemp(prefix="alpe_face_")
+    os.makedirs(os.path.join(root, "paintingface"), exist_ok=True)
+    for name in bundles:
+        open(os.path.join(root, "paintingface", name), "w").close()
+    return root
+
+
+def test_face_bundle_path_prefers_exact():
+    # 同名 bundle 存在时必须用它，不能回退到本体（这就是 tiancheng_cv_2 花脸的原因）
+    root = _face_dir(["tiancheng_cv", "tiancheng_cv_2", "tiancheng"])
+    try:
+        got = core.face_bundle_path(root, "tiancheng_cv_2", (184, 184))
+        assert os.path.basename(got) == "tiancheng_cv_2", got
+        got = core.face_bundle_path(root, "tiancheng_cv_2_n", (184, 184))
+        assert os.path.basename(got) == "tiancheng_cv_2", got
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_face_bundle_path_n_marker_is_direct():
+    # _n 不需要核对槽尺寸：同一张画，只是没装备
+    root = _face_dir(["2b"])
+    try:
+        with patch(core={"face_slot_size": lambda r, n: (_ for _ in ()).throw(AssertionError("不该解析槽"))}):
+            got = core.face_bundle_path(root, "2b_n")
+        assert os.path.basename(got) == "2b", got
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_face_bundle_path_rejects_other_skin():
+    # 只剩别人的 bundle，且脸槽对不上 -> 宁可没有表情，也不能套别人的脸
+    root = _face_dir(["tiancheng_cv"])
+    slots = {"painting/tiancheng_cv_2": (184, 184), "painting/tiancheng_cv": (90, 96)}
+    try:
+        with patch(core={"face_slot_size": lambda r, n: slots.get(n)}):
+            assert core.face_bundle_path(root, "tiancheng_cv_2", (184, 184)) is None
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_face_bundle_path_accepts_same_slot():
+    # _asmr / _ex 这类同图变体：脸槽一致就沿用本体表情
+    root = _face_dir(["hu_2"])
+    try:
+        with patch(core={"face_slot_size": lambda r, n: (331, 321)}):
+            got = core.face_bundle_path(root, "hu_2_asmr", (331, 321))
+        assert os.path.basename(got) == "hu_2", got
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_face_sort_key():
@@ -290,7 +344,7 @@ def test_export_flow():
         faces = [("1", solid(40, 40, (0, 255, 0, 255))),
                  ("2", solid(40, 40, (0, 0, 255, 255)))]
 
-        def fake_load_faces(source, painting, wanted=None):
+        def fake_load_faces(source, painting, wanted=None, slot=None):
             return [(n, im) for n, im in faces if wanted is None or n in wanted]
 
         def fake_analyze(source, name):

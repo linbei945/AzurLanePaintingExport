@@ -92,12 +92,13 @@ def preview_job(job: dict) -> dict:
         face_rect = None
         base_thumb = b""
         rect = core.face_layout(analysis, native=native)
+        _slot = core.slot_of(analysis)
         if rect is not None:
             x, y, w, h = rect[:4]
             face_rect = [x, y, w, h]
             patch = img.crop((max(0, x), max(0, y), max(0, x + w), max(0, y + h)))
             base_thumb = _thumb(patch)
-            for face_name, face_img in core.load_faces(src, name):
+            for face_name, face_img in core.load_faces(src, name, slot=_slot):
                 placed = (
                     face_img if face_img.size == (w, h)
                     else face_img.resize((w, h), Image.LANCZOS)

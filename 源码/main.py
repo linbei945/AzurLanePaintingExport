@@ -52,10 +52,13 @@ from PySide6.QtWidgets import (
 
 import core
 import worker
-from core import AssetSource, face_bundle_name
+from core import AssetSource, face_bundle_path
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
+
+# 表情 bundle 解析规则版本：改动候选命名规则时 +1，让旧的表情计数缓存失效
+FACE_RULE_VERSION = 2
 
 STATUS_QUEUED = "排队中"
 STATUS_DONE = "已完成"
@@ -812,12 +815,11 @@ class MainWindow(QMainWindow):
             return
 
         painting_dir = os.path.join(self.root, "painting")
-        face_dir = os.path.join(self.root, "paintingface")
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(names))
         pending: list[str] = []
         for row, name in enumerate(names):
-            has_bundle = os.path.isfile(os.path.join(face_dir, face_bundle_name(name)))
+            has_bundle = face_bundle_path(self.root, name) is not None
             self.faces_available[name] = 1 if has_bundle else 0
             if not has_bundle:
                 self.face_names_cache[name] = []
@@ -858,7 +860,7 @@ class MainWindow(QMainWindow):
         folder = os.path.join(self.root, "paintingface")
         try:
             st = os.stat(folder)
-            return f"{len(os.listdir(folder))}:{int(st.st_mtime)}"
+            return f"{FACE_RULE_VERSION}:{len(os.listdir(folder))}:{int(st.st_mtime)}"
         except Exception:
             return ""
 
@@ -930,7 +932,7 @@ class MainWindow(QMainWindow):
             cell = self.table.item(row, 1)
             if cell is None:
                 continue
-            has_bundle = os.path.isfile(os.path.join(self.root, "paintingface", face_bundle_name(name)))
+            has_bundle = face_bundle_path(self.root, name) is not None
             cell.setText(self._face_text(count, has_bundle))
             cell.setForeground(QColor("#2f6fed") if count else QColor("#8a93a8"))
         self.table.setUpdatesEnabled(True)

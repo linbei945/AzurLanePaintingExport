@@ -635,29 +635,142 @@ def crop_alpha(img: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------- faces
+# 立绘名尾部的标记：_n = 无装备差分（与本体检共用表情），
+# _hx = 特触 / 换装差分（可能自带一套表情，见 paintingface 里同名的 bundle）
+FACE_MARKERS = ("_n", "_hx")
+
+
+def _split_face_markers(painting: str) -> Tuple[str, List[str]]:
+    """拆出尾部的标记：``a_n_hx`` -> ``("a", ["_n", "_hx"])``。"""
+    base, tokens = painting, []
+    while True:
+        for marker in FACE_MARKERS:
+            if base.endswith(marker):
+                base = base[: -len(marker)]
+                tokens.insert(0, marker)
+                break
+        else:
+            return base, tokens
+
+
+def face_bundle_candidates(painting: str) -> List[str]:
+    """paintingface 里可能的 bundle 名，从最具体到最宽泛。
+
+    立绘名与表情 bundle 名基本一一对应（``tiancheng_cv_2`` 用
+    ``paintingface/tiancheng_cv_2``），只有两种差分要换算：
+
+    * ``_n`` 只是「无装备」，表情与本体完全相同 —— ``2b_n`` 用 ``2b``；
+    * ``_hx`` 若在 paintingface 里有自己的 bundle 就用它（``abuluqi_2_hx``），
+      没有才回落到本体（``2b_hx`` -> ``2b``）。
+
+    所以顺序是：原名 → 去掉 ``_n`` → 去掉全部标记 → 再从右往左逐段回退
+    （``_ex`` / ``_asmr`` / ``_hei`` / ``_dark_shadow`` 这类修饰词没有独立表情组时，
+    沿用本体那一套）。
+    """
+    base, tokens = _split_face_markers(painting)
+    names = [painting]
+    if "_n" in tokens:
+        names.append(base + "".join(t for t in tokens if t != "_n"))
+    names.append(base)
+    # 兜底：逐段去掉尾部修饰词
+    tail = base
+    while "_" in tail:
+        tail = tail.rsplit("_", 1)[0]
+        names.append(tail)
+
+    out: List[str] = []
+    for name in names:
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def face_bundle_name(painting: str) -> str:
-    """Port of ALPA's rule: take first two '_' chunks, drop a trailing _n."""
-    base = "_".join(painting.split("_", 2)[:2])
-    return re.sub(r"_n$", "", base)
+    """最宽泛的候选名（本体名），用于兜底判断。"""
+    return face_bundle_candidates(painting)[-1]
 
 
-def _face_bundle(root: str, painting: str) -> Optional[str]:
-    """Path of the paintingface bundle matching this painting, if present."""
-    for candidate in (face_bundle_name(painting), painting):
+# 表情槽尺寸 / AssetSource 缓存：解析依赖表很贵，不能每次重建
+_FACE_SLOT_CACHE: dict = {}
+_SOURCE_CACHE: dict = {}
+
+
+def _cached_source(root: str) -> "AssetSource":
+    source = _SOURCE_CACHE.get(root)
+    if source is None:
+        source = AssetSource(root)
+        _SOURCE_CACHE[root] = source
+    return source
+
+
+def slot_of(analysis: "Analysis") -> Optional[Tuple[int, int]]:
+    """已解析立绘的表情槽尺寸（没有脸槽则 ``None``）。"""
+    face = analysis.face
+    if face is None:
+        return None
+    return int(round(face.size.x)), int(round(face.size.y))
+
+
+def face_slot_size(root: str, painting: str) -> Optional[Tuple[int, int]]:
+    """立绘的差分表情槽尺寸（UI 单位），用于确认某个 bundle 到底对不对得上。"""
+    key = (root, painting)
+    if key in _FACE_SLOT_CACHE:
+        return _FACE_SLOT_CACHE[key]
+    size = None
+    try:
+        size = slot_of(analyze(_cached_source(root), "painting/" + painting))
+    except Exception:
+        size = None
+    _FACE_SLOT_CACHE[key] = size
+    return size
+
+
+def _same_slot(a, b) -> bool:
+    if not a or not b:
+        return False
+    return all(abs(x - y) <= max(1, round(y * 0.03)) for x, y in zip(a, b))
+
+
+def face_bundle_path(root: str, painting: str,
+                     slot: Optional[Tuple[int, int]] = None) -> Optional[str]:
+    """paintingface 里与该立绘匹配的 bundle 路径，没有则 ``None``。
+
+    同名 / ``_n`` / ``_hx`` 是同一人物的差分，可以直接换算；再往宽泛回退时
+    必须核对表情槽尺寸——不同皮肤（``tiancheng_cv_2`` 与 ``tiancheng_cv``）
+    脸槽大小不同，套用别人的表情就是花脸。
+    """
+    base, tokens = _split_face_markers(painting)
+    direct = {painting}
+    if "_n" in tokens:
+        direct.add(base + "".join(t for t in tokens if t != "_n"))
+
+    for candidate in face_bundle_candidates(painting):
         path = os.path.join(root, "paintingface", candidate)
-        if os.path.isfile(path):
+        if not os.path.isfile(path):
+            continue
+        if candidate in direct:
+            return path
+        mine = slot if slot is not None else face_slot_size(root, painting)
+        if _same_slot(mine, face_slot_size(root, candidate)):
             return path
     return None
 
 
+def _face_bundle(root: str, painting: str,
+                 slot: Optional[Tuple[int, int]] = None) -> Optional[str]:
+    """兼容旧调用名。"""
+    return face_bundle_path(root, painting, slot)
+
+
 def load_faces(source: AssetSource, painting: str,
-               wanted: Optional[set] = None) -> List[Tuple[str, Image.Image]]:
+               wanted: Optional[set] = None,
+               slot: Optional[Tuple[int, int]] = None) -> List[Tuple[str, Image.Image]]:
     """Expression sprites of a painting, sorted by expression number.
 
     ``wanted`` skips decoding sprites we are not going to write out — the
     texture decode is the expensive part of an export.
     """
-    path = _face_bundle(source.root, painting)
+    path = face_bundle_path(source.root, painting, slot)
     if path is None:
         return []
     try:
@@ -753,7 +866,8 @@ def export_painting(source: AssetSource, painting: str, out_dir: str,
     """
     analysis = analyze(source, "painting/" + painting)
     wanted = None if face_names is None else {str(n) for n in face_names}
-    faces = load_faces(source, painting, wanted) if export_faces else []
+    faces = (load_faces(source, painting, wanted, slot_of(analysis))
+             if export_faces else [])
 
     if export_base or not export_faces:
         want_base = True
