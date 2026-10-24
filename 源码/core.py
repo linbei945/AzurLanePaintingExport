@@ -173,6 +173,59 @@ def path_id(d) -> int:
     return int(d.get("m_PathID", 0)) if isinstance(d, dict) else 0
 
 
+# ---------------------------------------------------------------- list order
+# 「版本后缀」：同一个皮肤的多个版本，可组合出现（如 2b_n_hx）
+SKIN_VARIANT_TOKENS = ("_shophx", "_buildhx", "_n_hx", "_hx", "_n")
+# 组内显示顺序：原版 → _n → _hx → _n_hx → 遮挡层版本
+SKIN_VARIANT_RANK = {
+    "": 0,
+    "_n": 1,
+    "_hx": 2,
+    "_n_hx": 3,
+    "_buildhx": 4,
+    "_n_buildhx": 5,
+    "_shophx": 6,
+    "_n_shophx": 7,
+}
+
+
+def split_skin_name(name: str) -> Tuple[str, str]:
+    """把 ``2b_n_hx`` 拆成 ``("2b", "_n_hx")``。
+
+    只有 n / hx / buildhx / shophx 才算同一皮肤的「版本」，
+    其它后缀（``_2`` ``_3`` ``_alter`` ``_doa`` …）都是不同的皮肤。
+    """
+    low = name.lower()
+    end = len(low)
+    while True:
+        for token in SKIN_VARIANT_TOKENS:
+            if end > len(token) and low[:end].endswith(token):
+                end -= len(token)
+                break
+        else:
+            break
+    return name[:end], low[end:]
+
+
+def skin_base_key(base: str) -> tuple:
+    """按 ``_`` 分段比较：``abeikelongbi_2`` 排在 ``_3`` 前，``_2`` 排在 ``_10`` 前。"""
+    return tuple(
+        (0, int(seg), "") if seg.isdigit() else (1, 0, seg)
+        for seg in base.casefold().split("_")
+    )
+
+
+def skin_sort_key(name: str) -> Tuple[tuple, int, str, str]:
+    """列表排序键：同一皮肤的各版本相邻，数字字段按数值比较。"""
+    base, variant = split_skin_name(name)
+    return (
+        skin_base_key(base),
+        SKIN_VARIANT_RANK.get(variant, 100 + len(variant)),
+        base.casefold(),
+        name.casefold(),
+    )
+
+
 class AssetSource:
     """Loads bundles of one AssetBundles folder and caches the dependency table."""
 
@@ -218,7 +271,7 @@ class AssetSource:
         if not os.path.isdir(folder):
             return []
         out = []
-        for f in sorted(os.listdir(folder)):
+        for f in sorted(os.listdir(folder), key=skin_sort_key):
             if f.endswith("_tex") or f.endswith(".manifest") or f.endswith(".resS"):
                 continue
             if os.path.isfile(os.path.join(folder, f)):
@@ -356,6 +409,25 @@ def compute_raw_size(mono_ptr, tree, sprite) -> V2:
         return V2(tex.m_Width, tex.m_Height)
     except Exception:
         return V2(1, 1)
+
+
+# ---------------------------------------------------------------- overlays
+# 「和谐遮挡层」：prefab 里额外挂的一层贴纸（建造/商店预览用），不是皮肤本体。
+# 判定看 GameObject 名或它用的贴图名是否以这两个后缀结尾。
+OVERLAY_SUFFIXES = ("_buildhx", "_shophx")
+
+
+def is_overlay_part(part: "Part") -> bool:
+    for name in (getattr(part, "go_name", ""), getattr(part, "name", "")):
+        if name and name.lower().endswith(OVERLAY_SUFFIXES):
+            return True
+    return False
+
+
+def drop_overlays(analysis: "Analysis") -> "Analysis":
+    """把遮挡层从图层列表里摘掉（画布尺寸也会跟着收紧）。"""
+    analysis.parts = [p for p in analysis.parts if not is_overlay_part(p)]
+    return analysis
 
 
 # ---------------------------------------------------------------- rebuilding
@@ -880,7 +952,8 @@ def export_painting(source: AssetSource, painting: str, out_dir: str,
                     face_names: Optional[List[str]] = None,
                     face_offset: Tuple[int, int] = (0, 0),
                     export_base: bool = False,
-                    overwrite: bool = True) -> Tuple[List[str], int]:
+                    overwrite: bool = True,
+                    keep_overlay: bool = False) -> Tuple[List[str], int]:
     """Export one painting at native texture resolution.
 
     ``face_names`` selects what to write: ``"0"`` means the expression-free
@@ -888,9 +961,13 @@ def export_painting(source: AssetSource, painting: str, out_dir: str,
     falls back to the base image.  ``None`` keeps the batch behaviour (all
     expressions); ``export_base`` forces the base on top of that.
 
+    ``keep_overlay`` 为 False 时跳过 ``_buildhx`` / ``_shophx`` 这类和谐遮挡层。
+
     Returns ``(written files, number of files skipped because they existed)``.
     """
     analysis = analyze(source, "painting/" + painting)
+    if not keep_overlay:
+        drop_overlays(analysis)
     wanted = None if face_names is None else {str(n) for n in face_names}
     faces = (load_faces(source, painting, wanted, slot_of(analysis))
              if export_faces else [])

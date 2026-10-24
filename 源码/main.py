@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -55,7 +56,7 @@ import worker
 from core import AssetSource, face_bundle_exists
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.12.2"
+APP_VERSION = "1.13.0"
 
 # 表情 bundle 解析规则版本：改动候选命名规则时 +1，让旧的表情计数缓存失效
 FACE_RULE_VERSION = 2
@@ -77,6 +78,13 @@ QLineEdit, QComboBox {
     padding: 5px 8px; min-height: 20px;
 }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #2f6fed; }
+QToolButton#SearchClear {
+    border: none; background: transparent; color: #6b7280;
+    font-size: 16px; font-weight: 600; padding: 0px;
+    min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;
+}
+QToolButton#SearchClear:hover { color: #1f2430; background: #e8ecf5; border-radius: 9px; }
+QToolButton#SearchClear:pressed { background: #d9e0ee; }
 QPushButton {
     background: #ffffff; border: 1px solid #d8dce5; border-radius: 6px;
     padding: 6px 14px; min-height: 20px;
@@ -310,6 +318,7 @@ class MainWindow(QMainWindow):
         self.face_default: set[str] | None = None
         self._current_painting: str | None = None
         self.only_checked = False
+        self.show_hx = False          # 默认隐藏 _hx / _buildhx / _shophx 皮肤
         self._log_history: list[str] = []
         self.face_offsets: dict[str, tuple[int, int]] = {}
         self._current_face: str | None = None
@@ -411,6 +420,21 @@ class MainWindow(QMainWindow):
         self.ed_search = QLineEdit()
         self.ed_search.setPlaceholderText("搜索立绘名称，例如 hailunna / 2b / _rw")
         self.ed_search.textChanged.connect(self._apply_filter)
+        # 输入框右侧的「×」：清空已输入的文字（有内容时才出现）
+        self.btn_search_clear = QToolButton(self.ed_search)
+        self.btn_search_clear.setText("×")
+        self.btn_search_clear.setObjectName("SearchClear")
+        self.btn_search_clear.setToolTip("清空搜索内容")
+        self.btn_search_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_search_clear.setFocusPolicy(Qt.NoFocus)
+        self.btn_search_clear.setVisible(False)
+        self.btn_search_clear.clicked.connect(self.ed_search.clear)
+        inner = QHBoxLayout(self.ed_search)
+        inner.setContentsMargins(0, 0, 4, 0)
+        inner.addStretch(1)
+        inner.addWidget(self.btn_search_clear)
+        self.ed_search.setTextMargins(0, 0, 26, 0)
+        self.ed_search.textChanged.connect(self._on_search_changed)
         top.addWidget(self.ed_search, 1)
 
         self.cb_filter = QComboBox()
@@ -432,7 +456,10 @@ class MainWindow(QMainWindow):
         self.btn_only_checked.setCheckable(True)
         self.btn_only_checked.setToolTip("只看已经勾选的立绘，再点一次恢复全部")
         self.btn_only_checked.toggled.connect(self._on_only_checked)
-        for b in (btn_all, btn_none, btn_inv, self.btn_only_checked):
+        self.btn_show_hx = QPushButton("显示和谐版本")
+        self.btn_show_hx.setToolTip("显示文件名带 _hx / _buildhx / _shophx 的和谐皮肤（默认隐藏）")
+        self.btn_show_hx.clicked.connect(self._toggle_show_hx)
+        for b in (btn_all, btn_none, btn_inv, self.btn_only_checked, self.btn_show_hx):
             b.setFixedHeight(24)
             b.setStyleSheet(compact)
             top2.addWidget(b)
@@ -499,11 +526,20 @@ class MainWindow(QMainWindow):
         self.chk_crop = QCheckBox("裁剪透明边")
         self.chk_skip = QCheckBox("跳过已存在的文件")
         self.chk_skip.setChecked(True)
+        self.chk_overlay = QCheckBox("导出和谐版本")
+        self.chk_overlay.setChecked(False)
+        self.chk_overlay.setToolTip(
+            "不勾选：跳过 _buildhx / _shophx 这类和谐遮挡层（推荐）。\n"
+            "勾选：把遮挡贴纸一起合成为成品图。"
+        )
+        self.chk_overlay.toggled.connect(self._on_overlay_toggled)
         grid2.addWidget(self.chk_parts)
         grid2.addSpacing(6)
         grid2.addWidget(self.chk_crop)
         grid2.addSpacing(6)
         grid2.addWidget(self.chk_skip)
+        grid2.addSpacing(6)
+        grid2.addWidget(self.chk_overlay)
         grid2.addStretch(1)
         olay.addLayout(grid2)
         return opts
@@ -710,6 +746,7 @@ class MainWindow(QMainWindow):
         self.chk_parts.setChecked(self.settings.value("parts", False, bool))
         self.chk_crop.setChecked(self.settings.value("crop", False, bool))
         self.chk_skip.setChecked(self.settings.value("skip", True, bool))
+        self.chk_overlay.setChecked(self.settings.value("overlay", False, bool))
         # 默认「游戏布局」；换用新键名，避免旧版本存下的 scale=0 覆盖新默认值
         idx = int(self.settings.value("scale_mode", 1))
         self.cb_scale.setCurrentIndex(idx if 0 <= idx < self.cb_scale.count() else 1)
@@ -728,6 +765,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("parts", self.chk_parts.isChecked())
         self.settings.setValue("crop", self.chk_crop.isChecked())
         self.settings.setValue("skip", self.chk_skip.isChecked())
+        self.settings.setValue("overlay", self.chk_overlay.isChecked())
         self.settings.setValue("scale_mode", self.cb_scale.currentIndex())
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -958,6 +996,8 @@ class MainWindow(QMainWindow):
         mode = self.cb_filter.currentIndex()
         out = []
         for name in self.rows:
+            if not self.show_hx and is_hx_name(name):
+                continue
             if self.only_checked and not ignore_only_checked and name not in self.checked:
                 continue
             if text and text not in name.lower():
@@ -972,6 +1012,10 @@ class MainWindow(QMainWindow):
                 continue
             out.append(name)
         return out
+
+    def _on_search_changed(self, text: str) -> None:
+        """有输入内容时才显示搜索框里的「×」。"""
+        self.btn_search_clear.setVisible(bool(text))
 
     def _apply_filter(self) -> None:
         visible = set(self._visible_names())
@@ -1024,6 +1068,23 @@ class MainWindow(QMainWindow):
         if enabled:
             self._log(f"只显示已勾选的立绘（{len(self.checked)} 个）")
 
+    def _toggle_show_hx(self) -> None:
+        self.show_hx = not self.show_hx
+        self.btn_show_hx.setText("隐藏和谐版本" if self.show_hx else "显示和谐版本")
+        self._apply_filter()
+        hidden = sum(1 for n in self.rows if is_hx_name(n))
+        if self.show_hx:
+            self._log(f"已显示和谐版本皮肤（{hidden} 个）")
+        else:
+            self._log(f"已隐藏和谐版本皮肤（{hidden} 个）")
+
+    def _on_overlay_toggled(self, _checked: bool = False) -> None:
+        """切换「导出和谐版本」后立刻刷新预览，保证所见即所得。"""
+        if not hasattr(self, "preview"):
+            return
+        if self._current_name():
+            self._preview_timer.start()
+
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
             return
@@ -1074,6 +1135,7 @@ class MainWindow(QMainWindow):
             "root": self.root,
             "name": name,
             "native": self.cb_scale.currentIndex() == 0,
+            "overlay": self.chk_overlay.isChecked(),
         }
         try:
             fut = self.preview_pool.submit(worker.preview_job, job)
@@ -1310,6 +1372,7 @@ class MainWindow(QMainWindow):
             "crop": self.chk_crop.isChecked(),
             "level": self.sp_level.value(),
             "native": self.cb_scale.currentIndex() == 0,
+            "overlay": self.chk_overlay.isChecked(),
         }
         for name in names:
             row = self.rows.get(name)
@@ -1558,6 +1621,11 @@ class MainWindow(QMainWindow):
         )
 
 
+def is_hx_name(name: str) -> bool:
+    """文件名是否属于「和谐版本」皮肤（_hx / _n_hx / _buildhx / _shophx）。"""
+    return core.split_skin_name(name)[1] not in ("", "_n")
+
+
 def format_duration(seconds: float) -> str:
     seconds = int(max(0, seconds))
     if seconds < 60:
@@ -1634,6 +1702,8 @@ def run_cli(argv: list[str]) -> int:
     parser.add_argument("--base", action="store_true", help="同时导出无表情底图")
     parser.add_argument("--ui-scale", action="store_true",
                         help="按游戏布局尺寸输出（放大版，背景为上采样）")
+    parser.add_argument("--overlay", action="store_true",
+                        help="把 _buildhx / _shophx 和谐遮挡层一起合成（默认跳过）")
     parser.add_argument("--crop", action="store_true", help="裁剪透明边")
     parser.add_argument("--level", type=int, default=0, help="PNG 压缩等级 0-9（默认 0 不压缩）")
     args = parser.parse_args(argv[1:])
@@ -1650,6 +1720,7 @@ def run_cli(argv: list[str]) -> int:
         "crop": args.crop,
         "level": args.level,
         "native": not args.ui_scale,
+        "overlay": args.overlay,
         "face_names": face_names or None,
         "export_base": args.base,
     }

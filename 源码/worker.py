@@ -43,6 +43,7 @@ def export_job(job: dict) -> dict:
             face_offset=tuple(job.get("face_offset") or (0, 0)),
             export_base=job.get("export_base", False),
             overwrite=job.get("overwrite", True),
+            keep_overlay=job.get("overlay", False),
         )
         return {
             "name": name,
@@ -83,6 +84,8 @@ def preview_job(job: dict) -> dict:
     try:
         src = get_source(root)
         analysis = core.analyze(src, "painting/" + name)
+        if not job.get("overlay", False):
+            core.drop_overlays(analysis)
         native = job.get("native", True)
         img = core.compose_base(analysis, native)
         if img is None:

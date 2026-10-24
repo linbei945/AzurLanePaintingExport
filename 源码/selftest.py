@@ -116,6 +116,34 @@ def make_analysis(parts, face=None, canvas=(1920, 1080), root_name="root"):
 
 
 # ---------------------------------------------------------------- tests
+def test_is_hx_name():
+    try:
+        import main as ui  # noqa: PLC0415 - 没装 PySide6 时跳过
+    except Exception as exc:  # noqa: BLE001
+        print(f"[skip] is_hx_name（未安装 PySide6）: {exc}")
+        return
+    cases = {
+        "2b_hx": True, "2b_n_hx": True, "gezi_2_hx": True,
+        "dafeng_6_shophx": True, "gezi_buildhx": True, "xxx_hx_n": True,
+        "2b": False, "2b_n": False, "gezi_n": False, "gezi_build": False,
+        "hx_test": False,
+    }
+    for src, want in cases.items():
+        got = ui.is_hx_name(src)
+        assert got is want, f"{src} -> {got}，期望 {want}"
+
+
+def test_overlay_parts():
+    body = make_part("gezi_n", size=(100, 100))
+    sticker = make_part("gezi_buildhx", pos=(0, 60), size=(40, 40))
+    shop = make_part("gezi_shophx", pos=(0, 0), size=(30, 30))
+    assert core.is_overlay_part(sticker) and core.is_overlay_part(shop)
+    assert not core.is_overlay_part(body)
+    analysis = make_analysis([body, sticker, shop])
+    core.drop_overlays(analysis)
+    assert [p.go_name for p in analysis.parts] == ["gezi_n"], analysis.parts
+
+
 def test_face_bundle_candidates():
     cases = {
         # 关键回归：三段式皮肤名不能塌成前两段（tiancheng_cv_2 不是 tiancheng_cv）
@@ -212,6 +240,45 @@ def test_face_bundle_path_accepts_same_slot():
 def test_face_sort_key():
     names = ["10", "2", "1", "ex", "3"]
     assert sorted(names, key=core.face_sort_key) == ["1", "2", "3", "10", "ex"]
+
+
+def test_skin_split():
+    # n / hx / buildhx / shophx 都算同一皮肤的版本，可叠加
+    assert core.split_skin_name("2b_n_hx") == ("2b", "_n_hx")
+    assert core.split_skin_name("2b_n") == ("2b", "_n")
+    assert core.split_skin_name("dafeng_6_shophx") == ("dafeng_6", "_shophx")
+    assert core.split_skin_name("gezi_buildhx") == ("gezi", "_buildhx")
+    # 数字、字母后缀是真皮肤，不能并进同一组
+    assert core.split_skin_name("2b_2") == ("2b_2", "")
+    assert core.split_skin_name("bisimai_h") == ("bisimai_h", "")
+    assert core.split_skin_name("x_alter") == ("x_alter", "")
+
+
+def test_skin_sort_grouping():
+    names = ["2b_hx", "2b_2_n", "2b", "2b_n_hx", "2b_2", "2b_n"]
+    assert sorted(names, key=core.skin_sort_key) == [
+        "2b", "2b_n", "2b_hx", "2b_n_hx", "2b_2", "2b_2_n",
+    ]
+    # 数字皮肤按数值排：_2 在 _10 前，不同皮肤互不拆散
+    names = ["abeikelongbi_10", "abeikelongbi_2_dark", "abeikelongbi", "abeikelongbi_2"]
+    assert sorted(names, key=core.skin_sort_key) == [
+        "abeikelongbi", "abeikelongbi_2", "abeikelongbi_2_dark", "abeikelongbi_10",
+    ]
+    # 大写前缀也稳定
+    assert sorted(["Abc_n", "abc"], key=core.skin_sort_key) == ["abc", "Abc_n"]
+
+
+def test_list_order_end_to_end():
+    tmp = tempfile.mkdtemp(prefix="alpe_sort_")
+    try:
+        root = os.path.join(tmp, "AssetBundles")
+        os.makedirs(os.path.join(root, "painting"))
+        for name in ("2b_n_hx", "2b_2", "2b", "2b_hx", "2b_n", "2b_2_n", "2b_tex"):
+            open(os.path.join(root, "painting", name), "w").close()
+        got = core.AssetSource.list_paintings_static(root)
+        assert got == ["2b", "2b_n", "2b_hx", "2b_n_hx", "2b_2", "2b_2_n"], got
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_safe_name():
@@ -476,6 +543,38 @@ def test_ui_layer():
             win.cb_filter.setCurrentIndex(0)
             win.ed_search.setText("2b")
             assert win._visible_names() == ["2b", "2b_n"], win._visible_names()
+
+            # 搜索框右侧的「×」：有内容才出现，点一下清空并恢复全部列表
+            assert win.btn_search_clear.isHidden() is False, "有输入时清空按钮应显示"
+            win.btn_search_clear.click()
+            assert win.ed_search.text() == "", win.ed_search.text()
+            assert win.btn_search_clear.isHidden() is True, "清空后按钮应隐藏"
+            assert len(win._visible_names()) == 5, win._visible_names()
+
+            # 和谐版本：默认隐藏，点按钮才出现（测完恢复原状态）
+            saved = (win.rows, win.checked, win.faces_available, win.cb_filter.currentIndex(),
+                     win.ed_search.text())
+            try:
+                win.cb_filter.setCurrentIndex(0)
+                win.ed_search.setText("")
+                win.rows = {"2b": 0, "2b_hx": 1, "gezi_n": 2, "gezi_buildhx": 3}
+                win.checked = set()
+                win.faces_available = {k: 0 for k in win.rows}
+                assert win.btn_show_hx.text() == "显示和谐版本", win.btn_show_hx.text()
+                assert win._visible_names() == ["2b", "gezi_n"], win._visible_names()
+                win._toggle_show_hx()
+                assert win.btn_show_hx.text() == "隐藏和谐版本", win.btn_show_hx.text()
+                assert "2b_hx" in win._visible_names(), win._visible_names()
+                assert "gezi_buildhx" in win._visible_names(), win._visible_names()
+                win._toggle_show_hx()
+                assert win._visible_names() == ["2b", "gezi_n"], win._visible_names()
+            finally:
+                win.rows, win.checked, win.faces_available, idx, search = saved
+                win.cb_filter.setCurrentIndex(idx)
+                win.ed_search.setText(search)
+
+            # 导出和谐版本默认关闭
+            assert win.chk_overlay.isChecked() is False
 
             # 输出模式：默认游戏布局，两项文案不带括号后缀
             assert [win.cb_scale.itemText(i) for i in range(win.cb_scale.count())] == \
