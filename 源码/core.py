@@ -601,12 +601,16 @@ def face_layout(analysis: Analysis, offset: Tuple[int, int] = (0, 0),
         return None
     scale, w, h, origin = fit(analysis, native)
     slot = analysis.face
-    dw = max(1, int(round(slot.size.x * scale)))
-    dh = max(1, int(round(slot.size.y * scale)))
-    x = int(round((slot.paste.x - origin.x) * scale)) + int(offset[0])
-    # +offset[1] 表示往上：paste 是 y-up 坐标，值越大在图片里越靠上
-    y = int(round((slot.paste.y - origin.y) * scale)) + int(offset[1])
-    return x, h - y - dh, dw, dh, w, h
+    dw_f = slot.size.x * scale
+    dh_f = slot.size.y * scale
+    dw = max(1, int(round(dw_f)))
+    dh = max(1, int(round(dh_f)))
+    # 直接对「矩形上边缘」取整，比先取整位置再减高度更接近真实位置
+    x_f = (slot.paste.x - origin.x) * scale
+    top_f = h - (slot.paste.y - origin.y + FACE_SLOT_Y_BIAS) * scale - dh_f
+    # +offset[1] 表示往上
+    return (int(round(x_f)) + int(offset[0]),
+            int(round(top_f)) - int(offset[1]), dw, dh, w, h)
 
 
 def compose_face(analysis: Analysis, face_img: Image.Image, crop: bool = False,
@@ -635,6 +639,11 @@ def crop_alpha(img: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------- faces
+# 表情槽的 y 比实际内容低 1 个 UI 单位（RectTransform 的半开区间），不补偿的话
+# 贴图会整体下沉：把表情 sprite 与 rw 纹理按 1:1 像素比对，30 个样本里 28 个
+# 都差 1 像素，补偿后全部归零。
+FACE_SLOT_Y_BIAS = 1.0
+
 # 立绘名尾部的标记：_n = 无装备差分（与本体检共用表情），
 # _hx = 特触 / 换装差分（可能自带一套表情，见 paintingface 里同名的 bundle）
 FACE_MARKERS = ("_n", "_hx")

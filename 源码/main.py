@@ -55,7 +55,7 @@ import worker
 from core import AssetSource, face_bundle_exists
 
 APP_NAME = "碧蓝航线立绘导出器"
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.12.2"
 
 # 表情 bundle 解析规则版本：改动候选命名规则时 +1，让旧的表情计数缓存失效
 FACE_RULE_VERSION = 2

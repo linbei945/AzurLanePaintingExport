@@ -336,6 +336,19 @@ def test_compose_base_matches_texture_size():
     assert img.size == (500, 440), img.size
 
 
+def test_face_slot_y_bias():
+    # 表情槽声明的 y 比实际内容低 1 个 UI 单位：槽在 y-up 50..90、画布高 200，
+    # 理想顶边 200-90=110，补偿后应落在 109（否则整块表情会下沉 1px）
+    part = make_part("body", size=(200, 200), raw=core.V2(200, 200))
+    face = core.FaceSlot("face", "$face$", core.ExtTransform(
+        RectTransform("face", pos=(50, 50), size=(40, 40)), ROOT))
+    analysis = make_analysis([part], face)
+    assert core.face_layout(analysis) == (50, 109, 40, 40, 200, 200), core.face_layout(analysis)
+    # 手动上移/下移仍然叠加在这个基准之上（offset 正数 = 向上）
+    assert core.face_layout(analysis, offset=(0, 3))[1] == 106
+    assert core.face_layout(analysis, offset=(0, -2))[1] == 111
+
+
 def test_compose_face_negative_offset():
     part = make_part("body", size=(200, 200), raw=core.V2(200, 200))
     face = core.FaceSlot("face", "$face$", core.ExtTransform(
